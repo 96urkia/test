@@ -3,67 +3,133 @@ app.py
 ======
 Aplicacion Streamlit para practicar test de oposiciones de biblioteca.
 
-- Login contra una hoja de Google Sheets (columnas: usuario, contraseña).
+- Login contra una hoja de Google Sheets (columnas: usuario, contraseña, rol).
+- La base de datos (examenes.db) YA NO vive en GitHub: se descarga desde
+  Google Drive al iniciar sesión y, si un admin edita datos, se vuelve a
+  subir a Drive automáticamente.
 - Filtros por nivel, tipo_biblioteca y lugar (panel horizontal superior).
 - Test de preguntas aleatorias con opciones en orden aleatorio (panel vertical).
+- Panel de administración (solo rol "admin"): altas/bajas/ediciones de
+  exámenes, preguntas y respuestas, más un editor SQL libre para casos
+  que no cubra la interfaz (crear tablas nuevas, migraciones, etc.).
 
 Requiere:
-  - Un archivo "examenes.db" (generado con excel_a_db.py) en la misma carpeta
-    que este script (o cambia DB_PATH mas abajo).
-  - Un Google Sheet con columnas "usuario" y "contraseña", compartido con el
-    email de una cuenta de servicio de Google Cloud.
-  - Los secretos de Streamlit (ver README.md) configurados con:
+  - Un archivo "examenes.db" (generado con excel_a_db.py) subido a Google
+    Drive y COMPARTIDO como Editor con el email de la cuenta de servicio
+    (el mismo que usas en gcp_service_account).
+  - Un Google Sheet con columnas "usuario", "contraseña" y "rol"
+    ("admin" o "usuario"), compartido con esa misma cuenta de servicio.
+  - Secretos de Streamlit (secrets.toml) configurados con:
       [gcp_service_account]  -> credenciales JSON de la cuenta de servicio
-      sheet_id = "..."       -> ID del Google Sheet de usuarios
+      sheet_id   = "..."     -> ID del Google Sheet de usuarios
+      db_file_id = "..."     -> ID del archivo examenes.db en Google Drive
+  - En Google Cloud Console: la Google Drive API debe estar habilitada
+    para el proyecto de la cuenta de servicio (además de Sheets API).
+  - requirements.txt debe incluir: google-api-python-client
 """
 
+import io
 import random
+from datetime import datetime
 
 import gspread
 import pandas as pd
 import sqlite3
 import streamlit as st
 from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 
-st.set_page_config(page_title="Hola", page_icon="📚", layout="wide")
+st.set_page_config(page_title="Test Oposiciones Biblioteca", page_icon="📚", layout="wide")
 
-DB_PATH = "examenes.db"
+# Copia de trabajo local: en Streamlit Cloud /tmp es escribible durante la sesión
+DB_PATH = "/tmp/examenes.db"
+DB_FILE_ID = st.secrets.get("db_file_id")
+
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets.readonly",
+    "https://www.googleapis.com/auth/drive",
+]
 
 
 # ----------------------------------------------------------------------
-# LOGIN (Google Sheets)
+# CLIENTES GOOGLE (Sheets para login, Drive para la base de datos)
 # ----------------------------------------------------------------------
 
 @st.cache_resource
-def _cliente_google_sheets():
-    scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
-    creds = Credentials.from_service_account_info(
-        st.secrets["gcp_service_account"], scopes=scopes
-    )
-    return gspread.authorize(creds)
+def _credenciales_google():
+    return Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=SCOPES)
 
+
+@st.cache_resource
+def _cliente_google_sheets():
+    return gspread.authorize(_credenciales_google())
+
+
+@st.cache_resource
+def _cliente_drive():
+    return build("drive", "v3", credentials=_credenciales_google())
+
+
+# ----------------------------------------------------------------------
+# BASE DE DATOS: descarga / subida a Google Drive
+# ----------------------------------------------------------------------
+
+def descargar_db_desde_drive():
+    """Descarga examenes.db desde Drive a DB_PATH. Se llama una vez por sesión."""
+    drive = _cliente_drive()
+    solicitud = drive.files().get_media(fileId=DB_FILE_ID)
+    buffer = io.BytesIO()
+    downloader = MediaIoBaseDownload(buffer, solicitud)
+    completado = False
+    while not completado:
+        _, completado = downloader.next_chunk()
+    with open(DB_PATH, "wb") as f:
+        f.write(buffer.getvalue())
+
+
+def subir_db_a_drive():
+    """Sube la copia local (ya modificada) de vuelta a Drive, sobrescribiendo el archivo."""
+    drive = _cliente_drive()
+    media = MediaFileUpload(DB_PATH, mimetype="application/x-sqlite3", resumable=True)
+    drive.files().update(fileId=DB_FILE_ID, media_body=media).execute()
+    st.session_state.db_actualizada_en = datetime.now().strftime("%H:%M:%S")
+    # Los datos cacheados a partir del contenido antiguo quedan obsoletos
+    cargar_opciones_filtro.clear()
+    listar_examenes.clear()
+
+
+def guardar_y_sincronizar():
+    """Confirma la transacción sqlite local y sube el archivo actualizado a Drive."""
+    subir_db_a_drive()
+
+
+# ----------------------------------------------------------------------
+# LOGIN (Google Sheets) — ahora también devuelve el rol
+# ----------------------------------------------------------------------
 
 def _obtener_usuarios():
     cliente = _cliente_google_sheets()
     hoja = cliente.open_by_key(st.secrets["sheet_id"]).sheet1
-    return hoja.get_all_records()  # lista de dicts: [{"usuario": ..., "contraseña": ...}, ...]
+    return hoja.get_all_records()  # [{"usuario": ..., "contraseña": ..., "rol": ...}, ...]
 
 
-def verificar_login(usuario: str, contraseña: str) -> bool:
+def verificar_login(usuario: str, contraseña: str):
+    """Devuelve el rol ('admin' / 'usuario') si las credenciales son correctas, o None."""
     try:
         registros = _obtener_usuarios()
     except Exception as e:
         st.error(f"No se pudo conectar con la hoja de usuarios: {e}")
-        return False
+        return None
 
     usuario = usuario.strip()
     for fila in registros:
-        # admite "contraseña" o "contrasena" como nombre de columna
         clave_usuario = fila.get("usuario", "")
         clave_pass = fila.get("contraseña", fila.get("contrasena", ""))
         if str(clave_usuario).strip() == usuario and str(clave_pass).strip() == contraseña:
-            return True
-    return False
+            rol = str(fila.get("rol", "usuario")).strip().lower()
+            return rol or "usuario"
+    return None
 
 
 def pantalla_login():
@@ -77,24 +143,40 @@ def pantalla_login():
     if enviado:
         if not usuario or not contraseña:
             st.warning("Rellena usuario y contraseña.")
-        elif verificar_login(usuario, contraseña):
-            st.session_state.autenticado = True
-            st.session_state.usuario = usuario
-            st.rerun()
         else:
-            st.error("Usuario o contraseña incorrectos.")
+            rol = verificar_login(usuario, contraseña)
+            if rol is not None:
+                st.session_state.autenticado = True
+                st.session_state.usuario = usuario
+                st.session_state.rol = rol
+                st.rerun()
+            else:
+                st.error("Usuario o contraseña incorrectos.")
 
 
-if "autenticado" not in st.session_state:
-    st.session_state.autenticado = False
+for clave, valor in {"autenticado": False, "rol": "usuario", "db_lista": False}.items():
+    if clave not in st.session_state:
+        st.session_state[clave] = valor
 
 if not st.session_state.autenticado:
     pantalla_login()
     st.stop()
 
+# Descargar la base de datos desde Drive una vez por sesión, justo tras el login
+if not st.session_state.db_lista:
+    with st.spinner("Descargando base de datos desde Drive..."):
+        try:
+            descargar_db_desde_drive()
+            st.session_state.db_lista = True
+        except Exception as e:
+            st.error(f"No se pudo descargar examenes.db desde Drive: {e}")
+            st.stop()
+
+es_admin = st.session_state.rol == "admin"
+
 
 # ----------------------------------------------------------------------
-# ACCESO A LA BASE DE DATOS
+# CONSULTAS DE LECTURA (test)
 # ----------------------------------------------------------------------
 
 @st.cache_data(ttl=300)
@@ -157,7 +239,153 @@ def obtener_respuestas(id_pregunta):
 
 
 # ----------------------------------------------------------------------
-# ESTADO DE SESION
+# CONSULTAS Y ACCIONES DE ADMINISTRACIÓN (solo rol admin)
+# ----------------------------------------------------------------------
+
+@st.cache_data(ttl=60)
+def listar_examenes():
+    con = sqlite3.connect(DB_PATH)
+    df = pd.read_sql_query(
+        "SELECT id_examen, organismo, tipo_biblioteca, lugar, anio, titulo, nivel FROM examenes ORDER BY id_examen",
+        con,
+    )
+    con.close()
+    return df
+
+
+def cargar_examen(id_examen):
+    con = sqlite3.connect(DB_PATH)
+    df = pd.read_sql_query("SELECT * FROM examenes WHERE id_examen = ?", con, params=(id_examen,))
+    con.close()
+    return None if df.empty else df.iloc[0].to_dict()
+
+
+def guardar_examen(datos: dict, es_nuevo: bool):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    if es_nuevo:
+        cur.execute(
+            """INSERT INTO examenes (id_examen, organismo, tipo_biblioteca, lugar, anio, titulo, nivel)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (datos["id_examen"], datos["organismo"], datos["tipo_biblioteca"], datos["lugar"],
+             datos["anio"], datos["titulo"], datos["nivel"]),
+        )
+    else:
+        cur.execute(
+            """UPDATE examenes SET organismo=?, tipo_biblioteca=?, lugar=?, anio=?, titulo=?, nivel=?
+               WHERE id_examen=?""",
+            (datos["organismo"], datos["tipo_biblioteca"], datos["lugar"], datos["anio"],
+             datos["titulo"], datos["nivel"], datos["id_examen"]),
+        )
+    con.commit()
+    con.close()
+    guardar_y_sincronizar()
+
+
+def eliminar_examen(id_examen):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        "DELETE FROM respuestas WHERE id_pregunta IN (SELECT id_pregunta FROM preguntas WHERE id_examen=?)",
+        (id_examen,),
+    )
+    cur.execute("DELETE FROM preguntas WHERE id_examen=?", (id_examen,))
+    cur.execute("DELETE FROM examenes WHERE id_examen=?", (id_examen,))
+    con.commit()
+    con.close()
+    guardar_y_sincronizar()
+
+
+def cargar_preguntas_examen(id_examen):
+    con = sqlite3.connect(DB_PATH)
+    df = pd.read_sql_query(
+        "SELECT id_pregunta, texto_pregunta FROM preguntas WHERE id_examen = ? ORDER BY id_pregunta",
+        con, params=(id_examen,),
+    )
+    con.close()
+    return df
+
+
+def cargar_respuestas_pregunta(id_pregunta):
+    con = sqlite3.connect(DB_PATH)
+    df = pd.read_sql_query(
+        "SELECT letra, texto_respuesta, es_correcta FROM respuestas WHERE id_pregunta = ? ORDER BY letra",
+        con, params=(id_pregunta,),
+    )
+    con.close()
+    return {fila["letra"]: fila for _, fila in df.iterrows()}
+
+
+def siguiente_id_pregunta(id_examen):
+    con = sqlite3.connect(DB_PATH)
+    df = pd.read_sql_query("SELECT id_pregunta FROM preguntas WHERE id_examen = ?", con, params=(id_examen,))
+    con.close()
+    numeros = []
+    for pid in df["id_pregunta"]:
+        try:
+            numeros.append(int(str(pid).split("-P")[-1]))
+        except ValueError:
+            continue
+    siguiente = (max(numeros) + 1) if numeros else 1
+    return f"{id_examen}-P{siguiente:02d}"
+
+
+def guardar_pregunta(id_examen, id_pregunta, texto, respuestas: dict, correcta: str, es_nueva: bool):
+    """respuestas = {'A': 'texto...', 'B': 'texto...', 'C': ..., 'D': ...}; correcta = letra correcta."""
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    if es_nueva:
+        cur.execute(
+            "INSERT INTO preguntas (id_pregunta, id_examen, texto_pregunta) VALUES (?, ?, ?)",
+            (id_pregunta, id_examen, texto),
+        )
+    else:
+        cur.execute("UPDATE preguntas SET texto_pregunta=? WHERE id_pregunta=?", (texto, id_pregunta))
+
+    cur.execute("DELETE FROM respuestas WHERE id_pregunta=?", (id_pregunta,))
+    for letra, texto_resp in respuestas.items():
+        cur.execute(
+            "INSERT INTO respuestas (id_pregunta, letra, texto_respuesta, es_correcta) VALUES (?, ?, ?, ?)",
+            (id_pregunta, letra, texto_resp, 1 if letra == correcta else 0),
+        )
+    con.commit()
+    con.close()
+    guardar_y_sincronizar()
+
+
+def eliminar_pregunta(id_pregunta):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("DELETE FROM respuestas WHERE id_pregunta=?", (id_pregunta,))
+    cur.execute("DELETE FROM preguntas WHERE id_pregunta=?", (id_pregunta,))
+    con.commit()
+    con.close()
+    guardar_y_sincronizar()
+
+
+def ejecutar_sql_libre(sentencia: str):
+    """Ejecuta cualquier sentencia SQL (CREATE TABLE, ALTER, INSERT, UPDATE...).
+    Si es una consulta SELECT, devuelve un DataFrame; si no, hace commit y sincroniza."""
+    con = sqlite3.connect(DB_PATH)
+    try:
+        if sentencia.strip().lower().startswith("select"):
+            df = pd.read_sql_query(sentencia, con)
+            con.close()
+            return df
+        else:
+            cur = con.cursor()
+            cur.executescript(sentencia)
+            con.commit()
+            con.close()
+            guardar_y_sincronizar()
+            return None
+    except Exception:
+        con.close()
+        raise
+
+
+# ----------------------------------------------------------------------
+# ESTADO DE SESION (test)
 # ----------------------------------------------------------------------
 
 valores_por_defecto = {
@@ -186,7 +414,7 @@ def nueva_pregunta(niveles_sel, tipos_sel, lugares_sel):
 
 
 # ----------------------------------------------------------------------
-# CABECERA + PANEL HORIZONTAL DE FILTROS
+# CABECERA + NAVEGACIÓN
 # ----------------------------------------------------------------------
 
 cab_izq, cab_der = st.columns([5, 1])
@@ -198,94 +426,226 @@ with cab_der:
         st.session_state.clear()
         st.rerun()
 
-niveles, tipos, lugares = cargar_opciones_filtro()
-
-f1, f2, f3 = st.columns(3)
-with f1:
-    niveles_sel = st.multiselect("Nivel", niveles)
-with f2:
-    tipos_sel = st.multiselect("Tipo de biblioteca", tipos)
-with f3:
-    lugares_sel = st.multiselect("Lugar", lugares)
-
-st.divider()
-
-# Si cambian los filtros durante un test en marcha, se guarda para usarlos
-# en la siguiente pregunta que se pida.
-st.session_state.filtros_actuales = (tuple(niveles_sel), tuple(tipos_sel), tuple(lugares_sel))
-
-
-# ----------------------------------------------------------------------
-# PANEL VERTICAL: TEST
-# ----------------------------------------------------------------------
-
-marcador_izq, marcador_der = st.columns(2)
-marcador_izq.metric("✅ Aciertos", st.session_state.aciertos)
-marcador_der.metric("❌ Fallos", st.session_state.fallos)
-
-if not st.session_state.test_iniciado:
-    st.info("Ajusta los filtros si quieres (opcional) y pulsa Empezar test.")
-    if st.button("▶️ Empezar test", type="primary"):
-        st.session_state.test_iniciado = True
-        st.session_state.aciertos = 0
-        st.session_state.fallos = 0
-        nueva_pregunta(niveles_sel, tipos_sel, lugares_sel)
-        st.rerun()
+if es_admin:
+    pagina = st.sidebar.radio("Navegación", ["🧪 Test", "⚙️ Administración"])
 else:
-    if st.session_state.pregunta_actual is None:
-        st.warning("No hay preguntas disponibles con los filtros seleccionados.")
-        if st.button("🔁 Reintentar"):
+    pagina = "🧪 Test"
+
+st.sidebar.caption(f"Usuario: {st.session_state.usuario} ({st.session_state.rol})")
+if st.session_state.get("db_actualizada_en"):
+    st.sidebar.caption(f"Última sincronización con Drive: {st.session_state.db_actualizada_en}")
+
+
+# ----------------------------------------------------------------------
+# PÁGINA: TEST
+# ----------------------------------------------------------------------
+
+if pagina == "🧪 Test":
+    niveles, tipos, lugares = cargar_opciones_filtro()
+
+    f1, f2, f3 = st.columns(3)
+    with f1:
+        niveles_sel = st.multiselect("Nivel", niveles)
+    with f2:
+        tipos_sel = st.multiselect("Tipo de biblioteca", tipos)
+    with f3:
+        lugares_sel = st.multiselect("Lugar", lugares)
+
+    st.divider()
+
+    st.session_state.filtros_actuales = (tuple(niveles_sel), tuple(tipos_sel), tuple(lugares_sel))
+
+    marcador_izq, marcador_der = st.columns(2)
+    marcador_izq.metric("✅ Aciertos", st.session_state.aciertos)
+    marcador_der.metric("❌ Fallos", st.session_state.fallos)
+
+    if not st.session_state.test_iniciado:
+        st.info("Ajusta los filtros si quieres (opcional) y pulsa Empezar test.")
+        if st.button("▶️ Empezar test", type="primary"):
+            st.session_state.test_iniciado = True
+            st.session_state.aciertos = 0
+            st.session_state.fallos = 0
             nueva_pregunta(niveles_sel, tipos_sel, lugares_sel)
             st.rerun()
     else:
-        id_pregunta, texto_pregunta = st.session_state.pregunta_actual
-        st.subheader(texto_pregunta)
+        if st.session_state.pregunta_actual is None:
+            st.warning("No hay preguntas disponibles con los filtros seleccionados.")
+            if st.button("🔁 Reintentar"):
+                nueva_pregunta(niveles_sel, tipos_sel, lugares_sel)
+                st.rerun()
+        else:
+            id_pregunta, texto_pregunta = st.session_state.pregunta_actual
+            st.subheader(texto_pregunta)
 
-        etiquetas = [op["texto_respuesta"] for op in st.session_state.opciones_actuales]
-        seleccion = st.radio(
-            "Selecciona una respuesta:",
-            options=list(range(len(etiquetas))),
-            format_func=lambda i: etiquetas[i],
-            index=None,
-            key=f"radio_{id_pregunta}",
-            disabled=st.session_state.corregido,
-        )
+            etiquetas = [op["texto_respuesta"] for op in st.session_state.opciones_actuales]
+            seleccion = st.radio(
+                "Selecciona una respuesta:",
+                options=list(range(len(etiquetas))),
+                format_func=lambda i: etiquetas[i],
+                index=None,
+                key=f"radio_{id_pregunta}",
+                disabled=st.session_state.corregido,
+            )
 
-        col_corregir, col_siguiente = st.columns(2)
+            col_corregir, col_siguiente = st.columns(2)
 
-        with col_corregir:
-            if not st.session_state.corregido:
-                if st.button("✅ Corregir", disabled=seleccion is None, type="primary"):
-                    st.session_state.corregido = True
-                    elegida = st.session_state.opciones_actuales[seleccion]
-                    if elegida["es_correcta"]:
-                        st.session_state.aciertos += 1
-                    else:
-                        st.session_state.fallos += 1
-                    st.rerun()
+            with col_corregir:
+                if not st.session_state.corregido:
+                    if st.button("✅ Corregir", disabled=seleccion is None, type="primary"):
+                        st.session_state.corregido = True
+                        elegida = st.session_state.opciones_actuales[seleccion]
+                        if elegida["es_correcta"]:
+                            st.session_state.aciertos += 1
+                        else:
+                            st.session_state.fallos += 1
+                        st.rerun()
 
-        with col_siguiente:
-            if st.session_state.corregido:
-                if st.button("➡️ Siguiente pregunta", type="primary"):
-                    nueva_pregunta(niveles_sel, tipos_sel, lugares_sel)
-                    st.rerun()
+            with col_siguiente:
+                if st.session_state.corregido:
+                    if st.button("➡️ Siguiente pregunta", type="primary"):
+                        nueva_pregunta(niveles_sel, tipos_sel, lugares_sel)
+                        st.rerun()
 
-        if st.session_state.corregido and seleccion is not None:
-            elegida = st.session_state.opciones_actuales[seleccion]
-            if elegida["es_correcta"]:
-                st.success("¡Correcto! ✅")
-            else:
-                correctas = [
-                    op["texto_respuesta"]
-                    for op in st.session_state.opciones_actuales
-                    if op["es_correcta"]
-                ]
-                if correctas:
-                    st.error(f"Incorrecto ❌ — Respuesta correcta: {', '.join(correctas)}")
+            if st.session_state.corregido and seleccion is not None:
+                elegida = st.session_state.opciones_actuales[seleccion]
+                if elegida["es_correcta"]:
+                    st.success("¡Correcto! ✅")
                 else:
-                    st.warning("Incorrecto, y esta pregunta todavia no tiene respuesta correcta marcada en la base de datos.")
+                    correctas = [
+                        op["texto_respuesta"]
+                        for op in st.session_state.opciones_actuales
+                        if op["es_correcta"]
+                    ]
+                    if correctas:
+                        st.error(f"Incorrecto ❌ — Respuesta correcta: {', '.join(correctas)}")
+                    else:
+                        st.warning("Incorrecto, y esta pregunta todavia no tiene respuesta correcta marcada en la base de datos.")
 
-    if st.button("⏹️ Terminar test"):
-        st.session_state.test_iniciado = False
-        st.session_state.pregunta_actual = None
-        st.rerun()
+        if st.button("⏹️ Terminar test"):
+            st.session_state.test_iniciado = False
+            st.session_state.pregunta_actual = None
+            st.rerun()
+
+
+# ----------------------------------------------------------------------
+# PÁGINA: ADMINISTRACIÓN (solo rol admin)
+# ----------------------------------------------------------------------
+
+elif pagina == "⚙️ Administración":
+    tab_examenes, tab_sql = st.tabs(["📖 Exámenes y preguntas", "🛠️ SQL avanzado"])
+
+    # --- TAB 1: gestión de exámenes y preguntas -------------------------
+    with tab_examenes:
+        examenes_df = listar_examenes()
+        opciones_examen = ["➕ Nuevo examen"] + examenes_df["id_examen"].tolist()
+        seleccionado = st.selectbox("Selecciona un examen", opciones_examen)
+        es_nuevo_examen = seleccionado == "➕ Nuevo examen"
+
+        datos_examen = {} if es_nuevo_examen else cargar_examen(seleccionado)
+
+        with st.form("form_examen"):
+            st.markdown("#### Datos del examen")
+            id_examen = st.text_input("id_examen", value="" if es_nuevo_examen else datos_examen["id_examen"],
+                                       disabled=not es_nuevo_examen)
+            organismo = st.text_input("Organismo", value=datos_examen.get("organismo", ""))
+            tipo_biblioteca = st.text_input("Tipo de biblioteca", value=datos_examen.get("tipo_biblioteca", ""))
+            lugar = st.text_input("Lugar", value=datos_examen.get("lugar", ""))
+            anio = st.text_input("Año", value=str(datos_examen.get("anio", "")))
+            titulo = st.text_input("Título", value=datos_examen.get("titulo", ""))
+            nivel = st.text_input("Nivel", value=datos_examen.get("nivel", ""))
+            guardar = st.form_submit_button("💾 Guardar examen", type="primary")
+
+        if guardar:
+            if es_nuevo_examen and not id_examen:
+                st.warning("Indica un id_examen para el nuevo examen.")
+            else:
+                guardar_examen(
+                    {"id_examen": id_examen or seleccionado, "organismo": organismo,
+                     "tipo_biblioteca": tipo_biblioteca, "lugar": lugar, "anio": anio,
+                     "titulo": titulo, "nivel": nivel},
+                    es_nuevo=es_nuevo_examen,
+                )
+            st.success("Examen guardado y sincronizado con Drive.")
+            st.rerun()
+
+        if not es_nuevo_examen:
+            if st.button("🗑️ Eliminar examen (y todas sus preguntas)"):
+                eliminar_examen(seleccionado)
+                st.success("Examen eliminado y sincronizado con Drive.")
+                st.rerun()
+
+            st.divider()
+            st.markdown("#### Preguntas de este examen")
+
+            preguntas_df = cargar_preguntas_examen(seleccionado)
+            for _, fila in preguntas_df.iterrows():
+                id_pregunta = fila["id_pregunta"]
+                with st.expander(f"{id_pregunta} — {fila['texto_pregunta'][:70]}"):
+                    respuestas_actuales = cargar_respuestas_pregunta(id_pregunta)
+                    with st.form(f"form_pregunta_{id_pregunta}"):
+                        texto_pregunta = st.text_area("Enunciado", value=fila["texto_pregunta"])
+                        letras = ["A", "B", "C", "D"]
+                        textos_resp = {}
+                        for letra in letras:
+                            valor_actual = respuestas_actuales.get(letra, {}).get("texto_respuesta", "")
+                            textos_resp[letra] = st.text_input(f"Respuesta {letra}", value=valor_actual,
+                                                                key=f"resp_{id_pregunta}_{letra}")
+                        correcta_actual = next(
+                            (l for l, r in respuestas_actuales.items() if r.get("es_correcta")), "A"
+                        )
+                        correcta = st.radio("Respuesta correcta", letras,
+                                             index=letras.index(correcta_actual),
+                                             key=f"correcta_{id_pregunta}", horizontal=True)
+                        col_g, col_e = st.columns(2)
+                        guardar_p = col_g.form_submit_button("💾 Guardar pregunta", type="primary")
+                        eliminar_p = col_e.form_submit_button("🗑️ Eliminar pregunta")
+
+                    if guardar_p:
+                        guardar_pregunta(seleccionado, id_pregunta, texto_pregunta, textos_resp, correcta, es_nueva=False)
+                        st.success("Pregunta guardada y sincronizada con Drive.")
+                        st.rerun()
+                    if eliminar_p:
+                        eliminar_pregunta(id_pregunta)
+                        st.success("Pregunta eliminada y sincronizada con Drive.")
+                        st.rerun()
+
+            st.divider()
+            st.markdown("#### ➕ Añadir nueva pregunta")
+            nuevo_id = siguiente_id_pregunta(seleccionado)
+            st.caption(f"Se guardará con id: {nuevo_id}")
+            with st.form("form_nueva_pregunta"):
+                texto_nueva = st.text_area("Enunciado", key="texto_nueva_pregunta")
+                letras = ["A", "B", "C", "D"]
+                textos_resp_nuevos = {l: st.text_input(f"Respuesta {l}", key=f"nueva_resp_{l}") for l in letras}
+                correcta_nueva = st.radio("Respuesta correcta", letras, key="nueva_correcta", horizontal=True)
+                crear = st.form_submit_button("💾 Crear pregunta", type="primary")
+
+            if crear:
+                if not texto_nueva or any(not v for v in textos_resp_nuevos.values()):
+                    st.warning("Rellena el enunciado y las 4 respuestas.")
+                else:
+                    guardar_pregunta(seleccionado, nuevo_id, texto_nueva, textos_resp_nuevos, correcta_nueva, es_nueva=True)
+                    st.success("Pregunta creada y sincronizada con Drive.")
+                    st.rerun()
+
+    # --- TAB 2: SQL libre (crear tablas, migraciones, arreglos puntuales) --
+    with tab_sql:
+        st.warning(
+            "Modo avanzado: aquí puedes ejecutar cualquier sentencia SQL directamente "
+            "sobre examenes.db (CREATE TABLE, ALTER TABLE, INSERT, UPDATE, DELETE...). "
+            "Los cambios se suben a Drive al ejecutar. Úsalo con cuidado."
+        )
+        sentencia = st.text_area("Sentencia SQL", height=150,
+                                  placeholder="Ej: CREATE TABLE notas (id_pregunta TEXT, comentario TEXT);")
+        if st.button("▶️ Ejecutar", type="primary"):
+            if not sentencia.strip():
+                st.warning("Escribe alguna sentencia SQL.")
+            else:
+                try:
+                    resultado = ejecutar_sql_libre(sentencia)
+                    if resultado is not None:
+                        st.dataframe(resultado, use_container_width=True)
+                    else:
+                        st.success("Ejecutado y sincronizado con Drive.")
+                except Exception as e:
+                    st.error(f"Error al ejecutar: {e}")
