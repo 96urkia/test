@@ -25,7 +25,7 @@ import sqlite3
 import streamlit as st
 from google.oauth2.service_account import Credentials
 
-st.set_page_config(page_title="Test Oposiciones Biblioteca", page_icon="📚", layout="wide")
+st.set_page_config(page_title="Hola", page_icon="📚", layout="wide")
 
 DB_PATH = "examenes.db"
 
