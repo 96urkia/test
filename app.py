@@ -68,7 +68,7 @@ def verificar_login(usuario: str, contraseña: str) -> bool:
 
 def pantalla_login():
     st.title("🔐 Acceso")
-    st.caption("Introduce tus credenciales para acceder al test.")
+    st.caption("Introduce tus credenciales.")
     with st.form("login_form"):
         usuario = st.text_input("Usuario")
         contraseña = st.text_input("Contraseña", type="password")
