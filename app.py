@@ -42,6 +42,48 @@ from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 
 st.set_page_config(page_title="Test Oposiciones Biblioteca", page_icon="📚", layout="wide")
 
+st.markdown(
+    """
+    <style>
+    .tarjeta-respuesta {
+        border: 2px solid rgba(150, 150, 150, 0.4);
+        border-radius: 16px;
+        padding: 28px 16px;
+        text-align: center;
+        min-height: 150px;
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        align-items: center;
+        margin-bottom: 6px;
+        transition: border-color 0.2s ease, background-color 0.2s ease;
+    }
+    .tarjeta-respuesta .letra {
+        font-size: 2.6rem;
+        font-weight: 800;
+        line-height: 1;
+        margin-bottom: 10px;
+    }
+    .tarjeta-respuesta .texto {
+        font-size: 1.05rem;
+    }
+    .tarjeta-seleccionada {
+        border-color: #ff4b4b;
+        background-color: rgba(255, 75, 75, 0.08);
+    }
+    .tarjeta-correcta {
+        border-color: #21c354;
+        background-color: rgba(33, 195, 84, 0.12);
+    }
+    .tarjeta-incorrecta {
+        border-color: #ff4b4b;
+        background-color: rgba(255, 75, 75, 0.12);
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 # Copia de trabajo local: en Streamlit Cloud /tmp es escribible durante la sesión
 DB_PATH = "/tmp/examenes.db"
 DB_FILE_ID = st.secrets.get("db_file_id")
@@ -395,6 +437,9 @@ valores_por_defecto = {
     "corregido": False,
     "aciertos": 0,
     "fallos": 0,
+    "seleccion_actual": None,
+    "editando_pregunta": False,
+    "confirmar_eliminar_pregunta": False,
 }
 for clave, valor in valores_por_defecto.items():
     if clave not in st.session_state:
@@ -402,6 +447,9 @@ for clave, valor in valores_por_defecto.items():
 
 
 def nueva_pregunta(niveles_sel, tipos_sel, lugares_sel):
+    st.session_state.seleccion_actual = None
+    st.session_state.editando_pregunta = False
+    st.session_state.confirmar_eliminar_pregunta = False
     resultado = obtener_pregunta_aleatoria(niveles_sel, tipos_sel, lugares_sel)
     if resultado is None:
         st.session_state.pregunta_actual = None
@@ -475,55 +523,142 @@ if pagina == "🧪 Test":
                 st.rerun()
         else:
             id_pregunta, texto_pregunta = st.session_state.pregunta_actual
-            st.subheader(texto_pregunta)
 
-            etiquetas = [op["texto_respuesta"] for op in st.session_state.opciones_actuales]
-            seleccion = st.radio(
-                "Selecciona una respuesta:",
-                options=list(range(len(etiquetas))),
-                format_func=lambda i: etiquetas[i],
-                index=None,
-                key=f"radio_{id_pregunta}",
-                disabled=st.session_state.corregido,
-            )
-
-            col_corregir, col_siguiente = st.columns(2)
-
-            with col_corregir:
-                if not st.session_state.corregido:
-                    if st.button("✅ Corregir", disabled=seleccion is None, type="primary"):
-                        st.session_state.corregido = True
-                        elegida = st.session_state.opciones_actuales[seleccion]
-                        if elegida["es_correcta"]:
-                            st.session_state.aciertos += 1
-                        else:
-                            st.session_state.fallos += 1
+            if es_admin and not st.session_state.editando_pregunta and not st.session_state.confirmar_eliminar_pregunta:
+                col_pregunta, col_editar, col_eliminar = st.columns([6, 1, 1])
+                with col_pregunta:
+                    st.subheader(texto_pregunta)
+                with col_editar:
+                    if st.button("✏️ Editar", key=f"editar_{id_pregunta}", use_container_width=True):
+                        st.session_state.editando_pregunta = True
                         st.rerun()
+                with col_eliminar:
+                    if st.button("🗑️ Eliminar", key=f"eliminar_{id_pregunta}", use_container_width=True):
+                        st.session_state.confirmar_eliminar_pregunta = True
+                        st.rerun()
+            else:
+                st.subheader(texto_pregunta)
 
-            with col_siguiente:
-                if st.session_state.corregido:
-                    if st.button("➡️ Siguiente pregunta", type="primary"):
+            # --- Confirmación de borrado ------------------------------------
+            if st.session_state.confirmar_eliminar_pregunta:
+                st.warning(f"¿Seguro que quieres eliminar la pregunta **{id_pregunta}**? No se puede deshacer.")
+                col_si, col_no = st.columns(2)
+                with col_si:
+                    if st.button("✅ Sí, eliminar", type="primary", key="confirmar_eliminar_si"):
+                        eliminar_pregunta(id_pregunta)
+                        st.session_state.confirmar_eliminar_pregunta = False
                         nueva_pregunta(niveles_sel, tipos_sel, lugares_sel)
+                        st.success("Pregunta eliminada y sincronizada con Drive.")
+                        st.rerun()
+                with col_no:
+                    if st.button("Cancelar", key="confirmar_eliminar_no"):
+                        st.session_state.confirmar_eliminar_pregunta = False
                         st.rerun()
 
-            if st.session_state.corregido and seleccion is not None:
-                elegida = st.session_state.opciones_actuales[seleccion]
-                if elegida["es_correcta"]:
-                    st.success("¡Correcto! ✅")
-                else:
-                    correctas = [
-                        op["texto_respuesta"]
-                        for op in st.session_state.opciones_actuales
-                        if op["es_correcta"]
-                    ]
-                    if correctas:
-                        st.error(f"Incorrecto ❌ — Respuesta correcta: {', '.join(correctas)}")
+            # --- Edición inline de la pregunta ------------------------------
+            elif st.session_state.editando_pregunta:
+                respuestas_actuales = cargar_respuestas_pregunta(id_pregunta)
+                letras = ["A", "B", "C", "D"]
+                with st.form(f"form_editar_{id_pregunta}"):
+                    nuevo_texto = st.text_area("Enunciado", value=texto_pregunta)
+                    textos_resp = {}
+                    for letra in letras:
+                        valor_actual = respuestas_actuales.get(letra, {}).get("texto_respuesta", "")
+                        textos_resp[letra] = st.text_input(f"Respuesta {letra}", value=valor_actual,
+                                                            key=f"editar_resp_{id_pregunta}_{letra}")
+                    correcta_actual = next(
+                        (l for l, r in respuestas_actuales.items() if r.get("es_correcta")), "A"
+                    )
+                    correcta = st.radio("Respuesta correcta", letras, index=letras.index(correcta_actual),
+                                         horizontal=True, key=f"editar_correcta_{id_pregunta}")
+                    col_g, col_c = st.columns(2)
+                    guardar_edicion = col_g.form_submit_button("💾 Guardar cambios", type="primary")
+                    cancelar_edicion = col_c.form_submit_button("Cancelar")
+
+                if guardar_edicion:
+                    id_examen_actual = id_pregunta.split("-P")[0]
+                    guardar_pregunta(id_examen_actual, id_pregunta, nuevo_texto, textos_resp, correcta, es_nueva=False)
+                    st.session_state.editando_pregunta = False
+                    st.session_state.pregunta_actual = (id_pregunta, nuevo_texto)
+                    st.session_state.opciones_actuales = obtener_respuestas(id_pregunta)
+                    st.session_state.seleccion_actual = None
+                    st.success("Pregunta actualizada y sincronizada con Drive.")
+                    st.rerun()
+                if cancelar_edicion:
+                    st.session_state.editando_pregunta = False
+                    st.rerun()
+
+            # --- Panel normal: tarjetas de respuesta ------------------------
+            else:
+                opciones = st.session_state.opciones_actuales
+                letras_mostradas = ["A", "B", "C", "D"][:len(opciones)]
+                filas = [letras_mostradas[i:i + 2] for i in range(0, len(letras_mostradas), 2)]
+
+                idx = 0
+                for fila_letras in filas:
+                    cols = st.columns(len(fila_letras))
+                    for col, letra in zip(cols, fila_letras):
+                        op = opciones[idx]
+                        with col:
+                            clases = "tarjeta-respuesta"
+                            if st.session_state.corregido:
+                                if op["es_correcta"]:
+                                    clases += " tarjeta-correcta"
+                                elif st.session_state.seleccion_actual == idx:
+                                    clases += " tarjeta-incorrecta"
+                            elif st.session_state.seleccion_actual == idx:
+                                clases += " tarjeta-seleccionada"
+
+                            st.markdown(
+                                f"""<div class="{clases}">
+                                        <div class="letra">{letra}</div>
+                                        <div class="texto">{op['texto_respuesta']}</div>
+                                    </div>""",
+                                unsafe_allow_html=True,
+                            )
+                            if not st.session_state.corregido:
+                                if st.button("Seleccionar", key=f"sel_{id_pregunta}_{idx}", use_container_width=True):
+                                    st.session_state.seleccion_actual = idx
+                                    st.rerun()
+                        idx += 1
+
+                seleccion = st.session_state.seleccion_actual
+
+                col_corregir, col_siguiente = st.columns(2)
+
+                with col_corregir:
+                    if not st.session_state.corregido:
+                        if st.button("✅ Corregir", disabled=seleccion is None, type="primary"):
+                            st.session_state.corregido = True
+                            elegida = opciones[seleccion]
+                            if elegida["es_correcta"]:
+                                st.session_state.aciertos += 1
+                            else:
+                                st.session_state.fallos += 1
+                            st.rerun()
+
+                with col_siguiente:
+                    if st.session_state.corregido:
+                        if st.button("➡️ Siguiente pregunta", type="primary"):
+                            nueva_pregunta(niveles_sel, tipos_sel, lugares_sel)
+                            st.rerun()
+
+                if st.session_state.corregido and seleccion is not None:
+                    elegida = opciones[seleccion]
+                    if elegida["es_correcta"]:
+                        st.success("¡Correcto! ✅")
                     else:
-                        st.warning("Incorrecto, y esta pregunta todavia no tiene respuesta correcta marcada en la base de datos.")
+                        correctas = [op["texto_respuesta"] for op in opciones if op["es_correcta"]]
+                        if correctas:
+                            st.error(f"Incorrecto ❌ — Respuesta correcta: {', '.join(correctas)}")
+                        else:
+                            st.warning("Incorrecto, y esta pregunta todavia no tiene respuesta correcta marcada en la base de datos.")
 
         if st.button("⏹️ Terminar test"):
             st.session_state.test_iniciado = False
             st.session_state.pregunta_actual = None
+            st.session_state.editando_pregunta = False
+            st.session_state.confirmar_eliminar_pregunta = False
             st.rerun()
 
 
