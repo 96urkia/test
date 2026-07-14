@@ -132,9 +132,9 @@ def subir_db_a_drive():
     media = MediaFileUpload(DB_PATH, mimetype="application/x-sqlite3", resumable=True)
     drive.files().update(fileId=DB_FILE_ID, media_body=media).execute()
     st.session_state.db_actualizada_en = datetime.now().strftime("%H:%M:%S")
-    # Los datos cacheados a partir del contenido antiguo quedan obsoletos
-    cargar_opciones_filtro.clear()
-    listar_examenes.clear()
+    # Limpia toda la caché de datos (más robusto que referenciar funciones concretas,
+    # que en este punto del script pueden no estar definidas todavía)
+    st.cache_data.clear()
 
 
 def guardar_y_sincronizar():
