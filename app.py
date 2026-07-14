@@ -147,10 +147,30 @@ def _tabla_existe(cur, nombre):
     return cur.fetchone() is not None
 
 
+def etiquetas_desde_input(texto_input: str):
+    """El admin escribe 'Leyes, Historia, IFLA' separado por comas -> lista limpia."""
+    return [t.strip() for t in (texto_input or "").split(",") if t.strip()]
+
+
+def etiquetas_a_almacenamiento(lista_etiquetas):
+    """Guarda como ',tag1,tag2,' para poder buscar con LIKE '%,tag,%' sin falsos positivos."""
+    limpio = sorted(set(t for t in lista_etiquetas if t))
+    return ("," + ",".join(limpio) + ",") if limpio else ""
+
+
+def etiquetas_desde_almacenamiento(texto_guardado: str):
+    if not texto_guardado:
+        return []
+    return [t for t in texto_guardado.strip(",").split(",") if t]
+
+
+def etiquetas_como_texto_editable(texto_guardado: str):
+    return ", ".join(etiquetas_desde_almacenamiento(texto_guardado))
+
+
 def asegurar_esquema():
-    """Migración idempotente: añade la columna 'visible' a preguntas (si falta) y crea
-    la tabla 'informacion_extra' (si falta). Se ejecuta una vez por sesión tras descargar
-    la base de datos, así no hace falta tocar SQL a mano."""
+    """Migración idempotente: añade columnas/tablas nuevas si faltan. Se ejecuta una vez
+    por sesión tras descargar la base de datos, así no hace falta tocar SQL a mano."""
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cambios = False
@@ -159,12 +179,40 @@ def asegurar_esquema():
     if "visible" not in columnas_preguntas:
         cur.execute("ALTER TABLE preguntas ADD COLUMN visible INTEGER DEFAULT 1")
         cambios = True
+    if "etiquetas" not in columnas_preguntas:
+        cur.execute("ALTER TABLE preguntas ADD COLUMN etiquetas TEXT")
+        cambios = True
 
     if not _tabla_existe(cur, "informacion_extra"):
         cur.execute(
             """CREATE TABLE informacion_extra (
                    id_pregunta TEXT PRIMARY KEY,
                    contenido TEXT
+               )"""
+        )
+        cambios = True
+
+    if not _tabla_existe(cur, "preguntas_ocultas_usuario"):
+        cur.execute(
+            """CREATE TABLE preguntas_ocultas_usuario (
+                   usuario TEXT NOT NULL,
+                   id_pregunta TEXT NOT NULL,
+                   PRIMARY KEY (usuario, id_pregunta)
+               )"""
+        )
+        cambios = True
+
+    if not _tabla_existe(cur, "historial_fallos"):
+        cur.execute(
+            """CREATE TABLE historial_fallos (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   usuario TEXT,
+                   id_pregunta TEXT,
+                   id_examen TEXT,
+                   texto_pregunta TEXT,
+                   respuesta_elegida TEXT,
+                   respuesta_correcta TEXT,
+                   fecha TEXT
                )"""
         )
         cambios = True
@@ -266,15 +314,22 @@ def cargar_opciones_filtro():
     examenes_df = pd.read_sql_query(
         "SELECT id_examen, titulo, lugar, anio FROM examenes ORDER BY titulo", con
     )
+    etiquetas_df = pd.read_sql_query(
+        "SELECT etiquetas FROM preguntas WHERE etiquetas IS NOT NULL AND etiquetas <> ''", con
+    )
     con.close()
     examenes_opciones = {
         f"{fila['titulo']} — {fila['lugar']} ({fila['anio']})": fila["id_examen"]
         for _, fila in examenes_df.iterrows()
     }
-    return niveles, tipos, lugares, examenes_opciones
+    todas_etiquetas = set()
+    for valor in etiquetas_df["etiquetas"]:
+        todas_etiquetas.update(etiquetas_desde_almacenamiento(valor))
+    etiquetas_disponibles = sorted(todas_etiquetas)
+    return niveles, tipos, lugares, examenes_opciones, etiquetas_disponibles
 
 
-def obtener_pregunta_aleatoria(niveles_sel, tipos_sel, lugares_sel, examenes_sel=None):
+def obtener_pregunta_aleatoria(niveles_sel, tipos_sel, lugares_sel, examenes_sel=None, etiquetas_sel=None, usuario=None):
     con = sqlite3.connect(DB_PATH)
     # Las preguntas marcadas como no visibles quedan excluidas del test para todos los usuarios
     condiciones, params = ["(p.visible IS NULL OR p.visible = 1)"], []
@@ -291,6 +346,15 @@ def obtener_pregunta_aleatoria(niveles_sel, tipos_sel, lugares_sel, examenes_sel
     if examenes_sel:
         condiciones.append(f"e.id_examen IN ({','.join(['?'] * len(examenes_sel))})")
         params += examenes_sel
+    if etiquetas_sel:
+        sub = " OR ".join(["p.etiquetas LIKE ?"] * len(etiquetas_sel))
+        condiciones.append(f"({sub})")
+        params += [f"%,{t},%" for t in etiquetas_sel]
+    if usuario:
+        condiciones.append(
+            "p.id_pregunta NOT IN (SELECT id_pregunta FROM preguntas_ocultas_usuario WHERE usuario = ?)"
+        )
+        params.append(usuario)
 
     where = "WHERE " + " AND ".join(condiciones)
     query = f"""
@@ -330,6 +394,16 @@ def obtener_visible(id_pregunta):
     return bool(df.iloc[0]["visible"])
 
 
+def obtener_etiquetas_pregunta(id_pregunta):
+    """Devuelve las etiquetas de una pregunta como texto editable ('Leyes, IFLA')."""
+    con = sqlite3.connect(DB_PATH)
+    df = pd.read_sql_query("SELECT etiquetas FROM preguntas WHERE id_pregunta = ?", con, params=(id_pregunta,))
+    con.close()
+    if df.empty or not df.iloc[0]["etiquetas"]:
+        return ""
+    return etiquetas_como_texto_editable(df.iloc[0]["etiquetas"])
+
+
 def obtener_info_extra(id_pregunta):
     con = sqlite3.connect(DB_PATH)
     df = pd.read_sql_query(
@@ -339,6 +413,70 @@ def obtener_info_extra(id_pregunta):
     if df.empty or not df.iloc[0]["contenido"]:
         return ""
     return df.iloc[0]["contenido"]
+
+
+def ocultar_pregunta_para_usuario(usuario, id_pregunta):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        "INSERT OR IGNORE INTO preguntas_ocultas_usuario (usuario, id_pregunta) VALUES (?, ?)",
+        (usuario, id_pregunta),
+    )
+    con.commit()
+    con.close()
+    guardar_y_sincronizar()
+
+
+def contar_preguntas_ocultas_usuario(usuario):
+    con = sqlite3.connect(DB_PATH)
+    df = pd.read_sql_query(
+        "SELECT COUNT(*) AS n FROM preguntas_ocultas_usuario WHERE usuario = ?", con, params=(usuario,)
+    )
+    con.close()
+    return int(df.iloc[0]["n"])
+
+
+def restablecer_preguntas_ocultas_usuario(usuario):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("DELETE FROM preguntas_ocultas_usuario WHERE usuario = ?", (usuario,))
+    con.commit()
+    con.close()
+    guardar_y_sincronizar()
+
+
+def registrar_fallo(usuario, id_pregunta, texto_pregunta, respuesta_elegida, respuesta_correcta):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    id_examen = id_pregunta.split("-P")[0]
+    cur.execute(
+        """INSERT INTO historial_fallos
+               (usuario, id_pregunta, id_examen, texto_pregunta, respuesta_elegida, respuesta_correcta, fecha)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (usuario, id_pregunta, id_examen, texto_pregunta, respuesta_elegida, respuesta_correcta,
+         datetime.now().strftime("%d/%m/%Y %H:%M")),
+    )
+    con.commit()
+    con.close()
+    guardar_y_sincronizar()
+
+
+def cargar_fallos_usuario(usuario):
+    con = sqlite3.connect(DB_PATH)
+    df = pd.read_sql_query(
+        "SELECT * FROM historial_fallos WHERE usuario = ? ORDER BY id DESC", con, params=(usuario,)
+    )
+    con.close()
+    return df
+
+
+def borrar_fallos_usuario(usuario):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("DELETE FROM historial_fallos WHERE usuario = ?", (usuario,))
+    con.commit()
+    con.close()
+    guardar_y_sincronizar()
 
 
 # ----------------------------------------------------------------------
@@ -402,7 +540,7 @@ def eliminar_examen(id_examen):
 def cargar_preguntas_examen(id_examen):
     con = sqlite3.connect(DB_PATH)
     df = pd.read_sql_query(
-        "SELECT id_pregunta, texto_pregunta, visible FROM preguntas WHERE id_examen = ? ORDER BY id_pregunta",
+        "SELECT id_pregunta, texto_pregunta, visible, etiquetas FROM preguntas WHERE id_examen = ? ORDER BY id_pregunta",
         con, params=(id_examen,),
     )
     con.close()
@@ -434,21 +572,23 @@ def siguiente_id_pregunta(id_examen):
 
 
 def guardar_pregunta(id_examen, id_pregunta, texto, respuestas: dict, correcta: str, es_nueva: bool,
-                      visible: bool = True, info_extra: str = ""):
+                      visible: bool = True, info_extra: str = "", etiquetas_texto: str = ""):
     """respuestas = {'A': 'texto...', 'B': 'texto...', 'C': ..., 'D': ...}; correcta = letra correcta.
     visible=False oculta la pregunta del test para todos los usuarios.
-    info_extra es el texto que se muestra con el botón '❓' una vez corregida la pregunta."""
+    info_extra es el texto que se muestra con el botón '❓' una vez corregida la pregunta.
+    etiquetas_texto es una cadena separada por comas escrita por el admin, ej: 'Leyes, IFLA'."""
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
+    etiquetas_guardado = etiquetas_a_almacenamiento(etiquetas_desde_input(etiquetas_texto))
     if es_nueva:
         cur.execute(
-            "INSERT INTO preguntas (id_pregunta, id_examen, texto_pregunta, visible) VALUES (?, ?, ?, ?)",
-            (id_pregunta, id_examen, texto, 1 if visible else 0),
+            "INSERT INTO preguntas (id_pregunta, id_examen, texto_pregunta, visible, etiquetas) VALUES (?, ?, ?, ?, ?)",
+            (id_pregunta, id_examen, texto, 1 if visible else 0, etiquetas_guardado),
         )
     else:
         cur.execute(
-            "UPDATE preguntas SET texto_pregunta=?, visible=? WHERE id_pregunta=?",
-            (texto, 1 if visible else 0, id_pregunta),
+            "UPDATE preguntas SET texto_pregunta=?, visible=?, etiquetas=? WHERE id_pregunta=?",
+            (texto, 1 if visible else 0, etiquetas_guardado, id_pregunta),
         )
 
     cur.execute("DELETE FROM respuestas WHERE id_pregunta=?", (id_pregunta,))
@@ -525,12 +665,14 @@ for clave, valor in valores_por_defecto.items():
         st.session_state[clave] = valor
 
 
-def nueva_pregunta(niveles_sel, tipos_sel, lugares_sel, examenes_sel=None):
+def nueva_pregunta(niveles_sel, tipos_sel, lugares_sel, examenes_sel=None, etiquetas_sel=None):
     st.session_state.seleccion_actual = None
     st.session_state.editando_pregunta = False
     st.session_state.confirmar_eliminar_pregunta = False
     st.session_state.mostrar_info = False
-    resultado = obtener_pregunta_aleatoria(niveles_sel, tipos_sel, lugares_sel, examenes_sel)
+    resultado = obtener_pregunta_aleatoria(
+        niveles_sel, tipos_sel, lugares_sel, examenes_sel, etiquetas_sel, st.session_state.usuario
+    )
     if resultado is None:
         st.session_state.pregunta_actual = None
         st.session_state.opciones_actuales = None
@@ -554,14 +696,21 @@ with cab_der:
         st.session_state.clear()
         st.rerun()
 
+opciones_navegacion = ["🧪 Test", "📉 Mis fallos"]
 if es_admin:
-    pagina = st.sidebar.radio("Navegación", ["🧪 Test", "⚙️ Administración"])
-else:
-    pagina = "🧪 Test"
+    opciones_navegacion.append("⚙️ Administración")
+pagina = st.sidebar.radio("Navegación", opciones_navegacion)
 
 st.sidebar.caption(f"Usuario: {st.session_state.usuario} ({st.session_state.rol})")
 if st.session_state.get("db_actualizada_en"):
     st.sidebar.caption(f"Última sincronización con Drive: {st.session_state.db_actualizada_en}")
+
+with st.sidebar.expander("🙈 Preguntas que ya no ves"):
+    n_ocultas = contar_preguntas_ocultas_usuario(st.session_state.usuario)
+    st.write(f"Tienes {n_ocultas} pregunta(s) ocultas para ti.")
+    if n_ocultas and st.button("Volver a mostrarlas todas"):
+        restablecer_preguntas_ocultas_usuario(st.session_state.usuario)
+        st.rerun()
 
 
 # ----------------------------------------------------------------------
@@ -569,9 +718,9 @@ if st.session_state.get("db_actualizada_en"):
 # ----------------------------------------------------------------------
 
 if pagina == "🧪 Test":
-    niveles, tipos, lugares, examenes_opciones = cargar_opciones_filtro()
+    niveles, tipos, lugares, examenes_opciones, etiquetas_disponibles = cargar_opciones_filtro()
 
-    f1, f2, f3, f4 = st.columns(4)
+    f1, f2, f3, f4, f5 = st.columns(5)
     with f1:
         niveles_sel = st.multiselect("Nivel", niveles)
     with f2:
@@ -580,11 +729,15 @@ if pagina == "🧪 Test":
         lugares_sel = st.multiselect("Lugar", lugares)
     with f4:
         examenes_sel_nombres = st.multiselect("Examen concreto", list(examenes_opciones.keys()))
+    with f5:
+        etiquetas_sel = st.multiselect("Tema / etiqueta", etiquetas_disponibles)
     examenes_sel = [examenes_opciones[nombre] for nombre in examenes_sel_nombres]
 
     st.divider()
 
-    st.session_state.filtros_actuales = (tuple(niveles_sel), tuple(tipos_sel), tuple(lugares_sel), tuple(examenes_sel))
+    st.session_state.filtros_actuales = (
+        tuple(niveles_sel), tuple(tipos_sel), tuple(lugares_sel), tuple(examenes_sel), tuple(etiquetas_sel)
+    )
 
     marcador_izq, marcador_der = st.columns(2)
     marcador_izq.metric("✅ Aciertos", st.session_state.aciertos)
@@ -596,13 +749,13 @@ if pagina == "🧪 Test":
             st.session_state.test_iniciado = True
             st.session_state.aciertos = 0
             st.session_state.fallos = 0
-            nueva_pregunta(niveles_sel, tipos_sel, lugares_sel, examenes_sel)
+            nueva_pregunta(niveles_sel, tipos_sel, lugares_sel, examenes_sel, etiquetas_sel)
             st.rerun()
     else:
         if st.session_state.pregunta_actual is None:
             st.warning("No hay preguntas disponibles con los filtros seleccionados.")
             if st.button("🔁 Reintentar"):
-                nueva_pregunta(niveles_sel, tipos_sel, lugares_sel, examenes_sel)
+                nueva_pregunta(niveles_sel, tipos_sel, lugares_sel, examenes_sel, etiquetas_sel)
                 st.rerun()
         else:
             id_pregunta, texto_pregunta = st.session_state.pregunta_actual
@@ -622,6 +775,12 @@ if pagina == "🧪 Test":
             else:
                 st.subheader(texto_pregunta)
 
+            if not st.session_state.editando_pregunta and not st.session_state.confirmar_eliminar_pregunta:
+                if st.button("🙈 No volver a mostrarme esta pregunta", key=f"ocultar_yo_{id_pregunta}"):
+                    ocultar_pregunta_para_usuario(st.session_state.usuario, id_pregunta)
+                    nueva_pregunta(niveles_sel, tipos_sel, lugares_sel, examenes_sel, etiquetas_sel)
+                    st.rerun()
+
             # --- Confirmación de borrado ------------------------------------
             if st.session_state.confirmar_eliminar_pregunta:
                 st.warning(f"¿Seguro que quieres eliminar la pregunta **{id_pregunta}**? No se puede deshacer.")
@@ -630,7 +789,7 @@ if pagina == "🧪 Test":
                     if st.button("✅ Sí, eliminar", type="primary", key="confirmar_eliminar_si"):
                         eliminar_pregunta(id_pregunta)
                         st.session_state.confirmar_eliminar_pregunta = False
-                        nueva_pregunta(niveles_sel, tipos_sel, lugares_sel, examenes_sel)
+                        nueva_pregunta(niveles_sel, tipos_sel, lugares_sel, examenes_sel, etiquetas_sel)
                         st.success("Pregunta eliminada y sincronizada con Drive.")
                         st.rerun()
                 with col_no:
@@ -643,6 +802,7 @@ if pagina == "🧪 Test":
                 respuestas_actuales = cargar_respuestas_pregunta(id_pregunta)
                 visible_actual = obtener_visible(id_pregunta)
                 info_actual = obtener_info_extra(id_pregunta)
+                etiquetas_actual = obtener_etiquetas_pregunta(id_pregunta)
                 letras = ["A", "B", "C", "D"]
                 with st.form(f"form_editar_{id_pregunta}"):
                     nuevo_texto = st.text_area("Enunciado", value=texto_pregunta)
@@ -663,6 +823,10 @@ if pagina == "🧪 Test":
                              "(por ejemplo, normativa regional que no te interese practicar).",
                         key=f"editar_visible_{id_pregunta}",
                     )
+                    etiquetas_nuevas = st.text_input(
+                        "🏷️ Etiquetas (separadas por comas, ej: Leyes, IFLA)",
+                        value=etiquetas_actual, key=f"editar_etiquetas_{id_pregunta}",
+                    )
                     info_nueva = st.text_area(
                         "ℹ️ Información complementaria (se muestra con el botón ❓ tras corregir)",
                         value=info_actual, height=100, key=f"editar_info_{id_pregunta}",
@@ -674,7 +838,7 @@ if pagina == "🧪 Test":
                 if guardar_edicion:
                     id_examen_actual = id_pregunta.split("-P")[0]
                     guardar_pregunta(id_examen_actual, id_pregunta, nuevo_texto, textos_resp, correcta, es_nueva=False,
-                                      visible=visible_chk, info_extra=info_nueva)
+                                      visible=visible_chk, info_extra=info_nueva, etiquetas_texto=etiquetas_nuevas)
                     st.session_state.editando_pregunta = False
                     if visible_chk:
                         st.session_state.pregunta_actual = (id_pregunta, nuevo_texto)
@@ -683,7 +847,7 @@ if pagina == "🧪 Test":
                         st.success("Pregunta actualizada y sincronizada con Drive.")
                     else:
                         st.success("Pregunta actualizada, oculta y sincronizada con Drive. Pasando a la siguiente...")
-                        nueva_pregunta(niveles_sel, tipos_sel, lugares_sel, examenes_sel)
+                        nueva_pregunta(niveles_sel, tipos_sel, lugares_sel, examenes_sel, etiquetas_sel)
                     st.rerun()
                 if cancelar_edicion:
                     st.session_state.editando_pregunta = False
@@ -735,12 +899,15 @@ if pagina == "🧪 Test":
                                 st.session_state.aciertos += 1
                             else:
                                 st.session_state.fallos += 1
+                                correcta_texto = next((op["texto_respuesta"] for op in opciones if op["es_correcta"]), "")
+                                registrar_fallo(st.session_state.usuario, id_pregunta, texto_pregunta,
+                                                 elegida["texto_respuesta"], correcta_texto)
                             st.rerun()
 
                 with col_siguiente:
                     if st.session_state.corregido:
                         if st.button("➡️ Siguiente pregunta", type="primary"):
-                            nueva_pregunta(niveles_sel, tipos_sel, lugares_sel, examenes_sel)
+                            nueva_pregunta(niveles_sel, tipos_sel, lugares_sel, examenes_sel, etiquetas_sel)
                             st.rerun()
 
                 if st.session_state.corregido and seleccion is not None:
@@ -768,6 +935,30 @@ if pagina == "🧪 Test":
             st.session_state.editando_pregunta = False
             st.session_state.confirmar_eliminar_pregunta = False
             st.rerun()
+
+
+# ----------------------------------------------------------------------
+# PÁGINA: MIS FALLOS (todos los usuarios)
+# ----------------------------------------------------------------------
+
+elif pagina == "📉 Mis fallos":
+    st.subheader("📉 Preguntas que has fallado")
+    fallos_df = cargar_fallos_usuario(st.session_state.usuario)
+
+    if fallos_df.empty:
+        st.info("Todavía no has fallado ninguna pregunta. ¡Sigue así!")
+    else:
+        st.caption(f"{len(fallos_df)} fallo(s) registrados.")
+        if st.button("🗑️ Borrar mi historial de fallos"):
+            borrar_fallos_usuario(st.session_state.usuario)
+            st.rerun()
+
+        for _, fila in fallos_df.iterrows():
+            with st.expander(f"{fila['fecha']} — {fila['texto_pregunta'][:70]}"):
+                st.write(f"**Examen:** {fila['id_examen']}  |  **Pregunta:** {fila['id_pregunta']}")
+                st.write(fila["texto_pregunta"])
+                st.error(f"Tu respuesta: {fila['respuesta_elegida']}")
+                st.success(f"Respuesta correcta: {fila['respuesta_correcta']}")
 
 
 # ----------------------------------------------------------------------
@@ -828,6 +1019,7 @@ elif pagina == "⚙️ Administración":
                 with st.expander(f"{icono_oculta}{id_pregunta} — {fila['texto_pregunta'][:70]}"):
                     respuestas_actuales = cargar_respuestas_pregunta(id_pregunta)
                     info_actual = obtener_info_extra(id_pregunta)
+                    etiquetas_actual = etiquetas_como_texto_editable(fila.get("etiquetas"))
                     with st.form(f"form_pregunta_{id_pregunta}"):
                         texto_pregunta = st.text_area("Enunciado", value=fila["texto_pregunta"])
                         letras = ["A", "B", "C", "D"]
@@ -848,6 +1040,10 @@ elif pagina == "⚙️ Administración":
                             help="Desmárcalo para dejar de mostrar esta pregunta a todos los usuarios.",
                             key=f"visible_{id_pregunta}",
                         )
+                        etiquetas_nuevas = st.text_input(
+                            "🏷️ Etiquetas (separadas por comas, ej: Leyes, IFLA)",
+                            value=etiquetas_actual, key=f"etiquetas_{id_pregunta}",
+                        )
                         info_nueva = st.text_area(
                             "ℹ️ Información complementaria (se muestra con el botón ❓ tras corregir)",
                             value=info_actual, height=100, key=f"info_{id_pregunta}",
@@ -858,7 +1054,7 @@ elif pagina == "⚙️ Administración":
 
                     if guardar_p:
                         guardar_pregunta(seleccionado, id_pregunta, texto_pregunta, textos_resp, correcta, es_nueva=False,
-                                          visible=visible_chk, info_extra=info_nueva)
+                                          visible=visible_chk, info_extra=info_nueva, etiquetas_texto=etiquetas_nuevas)
                         st.success("Pregunta guardada y sincronizada con Drive.")
                         st.rerun()
                     if eliminar_p:
@@ -876,6 +1072,9 @@ elif pagina == "⚙️ Administración":
                 textos_resp_nuevos = {l: st.text_input(f"Respuesta {l}", key=f"nueva_resp_{l}") for l in letras}
                 correcta_nueva = st.radio("Respuesta correcta", letras, key="nueva_correcta", horizontal=True)
                 visible_nueva = st.checkbox("👁️ Visible para todos en el test", value=True, key="nueva_visible")
+                etiquetas_nueva = st.text_input(
+                    "🏷️ Etiquetas (separadas por comas, ej: Leyes, IFLA)", key="nueva_etiquetas",
+                )
                 info_nueva = st.text_area(
                     "ℹ️ Información complementaria (se muestra con el botón ❓ tras corregir)",
                     key="nueva_info", height=100,
@@ -887,7 +1086,7 @@ elif pagina == "⚙️ Administración":
                     st.warning("Rellena el enunciado y las 4 respuestas.")
                 else:
                     guardar_pregunta(seleccionado, nuevo_id, texto_nueva, textos_resp_nuevos, correcta_nueva, es_nueva=True,
-                                      visible=visible_nueva, info_extra=info_nueva)
+                                      visible=visible_nueva, info_extra=info_nueva, etiquetas_texto=etiquetas_nueva)
                     st.success("Pregunta creada y sincronizada con Drive.")
                     st.rerun()
 
