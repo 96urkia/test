@@ -742,6 +742,10 @@ with cab_der:
 opciones_navegacion = ["🧪 Test", "📉 Mis fallos"]
 if es_admin:
     opciones_navegacion.append("⚙️ Administración")
+if st.session_state.get("forzar_pagina"):
+    st.session_state.nav_radio = st.session_state.forzar_pagina
+    st.session_state.forzar_pagina = None
+
 pagina = st.sidebar.radio("Navegación", opciones_navegacion, key="nav_radio")
 
 st.sidebar.caption(f"Usuario: {st.session_state.usuario} ({st.session_state.rol})")
@@ -1040,7 +1044,7 @@ elif pagina == "📉 Mis fallos":
                 st.session_state.aciertos = 0
                 st.session_state.fallos = 0
                 nueva_pregunta([], [], [], [], [])
-                st.session_state.nav_radio = "🧪 Test"
+                st.session_state.forzar_pagina = "🧪 Test"
                 st.rerun()
         with col_borrar:
             if st.button("🗑️ Borrar mi historial de fallos", use_container_width=True):
