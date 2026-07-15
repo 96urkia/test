@@ -415,6 +415,20 @@ def obtener_info_extra(id_pregunta):
     return df.iloc[0]["contenido"]
 
 
+def obtener_origen_pregunta(id_pregunta):
+    """Devuelve un dict con los datos del examen del que procede la pregunta (o None)."""
+    con = sqlite3.connect(DB_PATH)
+    df = pd.read_sql_query(
+        """SELECT e.id_examen, e.titulo, e.organismo, e.tipo_biblioteca, e.lugar, e.anio, e.nivel
+           FROM preguntas p
+           JOIN examenes e ON e.id_examen = p.id_examen
+           WHERE p.id_pregunta = ?""",
+        con, params=(id_pregunta,),
+    )
+    con.close()
+    return None if df.empty else df.iloc[0].to_dict()
+
+
 def ocultar_pregunta_para_usuario(usuario, id_pregunta):
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
@@ -477,6 +491,26 @@ def borrar_fallos_usuario(usuario):
     con.commit()
     con.close()
     guardar_y_sincronizar()
+
+
+def obtener_siguiente_de_repaso():
+    """Devuelve la siguiente pregunta de la cola de repaso (st.session_state.cola_repaso),
+    saltando las que hayan podido ser eliminadas mientras tanto. None si ya no quedan."""
+    cola = st.session_state.get("cola_repaso", [])
+    indice = st.session_state.get("indice_repaso", 0)
+    while indice < len(cola):
+        id_pregunta = cola[indice]
+        indice += 1
+        con = sqlite3.connect(DB_PATH)
+        df = pd.read_sql_query(
+            "SELECT texto_pregunta FROM preguntas WHERE id_pregunta = ?", con, params=(id_pregunta,)
+        )
+        con.close()
+        if not df.empty:
+            st.session_state.indice_repaso = indice
+            return id_pregunta, df.iloc[0]["texto_pregunta"]
+    st.session_state.indice_repaso = indice
+    return None
 
 
 # ----------------------------------------------------------------------
@@ -659,6 +693,10 @@ valores_por_defecto = {
     "editando_pregunta": False,
     "confirmar_eliminar_pregunta": False,
     "mostrar_info": False,
+    "mostrar_origen": False,
+    "modo_repaso": False,
+    "cola_repaso": [],
+    "indice_repaso": 0,
 }
 for clave, valor in valores_por_defecto.items():
     if clave not in st.session_state:
@@ -670,9 +708,14 @@ def nueva_pregunta(niveles_sel, tipos_sel, lugares_sel, examenes_sel=None, etiqu
     st.session_state.editando_pregunta = False
     st.session_state.confirmar_eliminar_pregunta = False
     st.session_state.mostrar_info = False
-    resultado = obtener_pregunta_aleatoria(
-        niveles_sel, tipos_sel, lugares_sel, examenes_sel, etiquetas_sel, st.session_state.usuario
-    )
+    st.session_state.mostrar_origen = False
+
+    if st.session_state.modo_repaso:
+        resultado = obtener_siguiente_de_repaso()
+    else:
+        resultado = obtener_pregunta_aleatoria(
+            niveles_sel, tipos_sel, lugares_sel, examenes_sel, etiquetas_sel, st.session_state.usuario
+        )
     if resultado is None:
         st.session_state.pregunta_actual = None
         st.session_state.opciones_actuales = None
@@ -699,7 +742,7 @@ with cab_der:
 opciones_navegacion = ["🧪 Test", "📉 Mis fallos"]
 if es_admin:
     opciones_navegacion.append("⚙️ Administración")
-pagina = st.sidebar.radio("Navegación", opciones_navegacion)
+pagina = st.sidebar.radio("Navegación", opciones_navegacion, key="nav_radio")
 
 st.sidebar.caption(f"Usuario: {st.session_state.usuario} ({st.session_state.rol})")
 if st.session_state.get("db_actualizada_en"):
@@ -718,20 +761,31 @@ with st.sidebar.expander("🙈 Preguntas que ya no ves"):
 # ----------------------------------------------------------------------
 
 if pagina == "🧪 Test":
-    niveles, tipos, lugares, examenes_opciones, etiquetas_disponibles = cargar_opciones_filtro()
+    if st.session_state.modo_repaso:
+        total_repaso = len(st.session_state.cola_repaso)
+        hechas_repaso = min(st.session_state.indice_repaso, total_repaso)
+        st.info(f"🔁 Modo repaso de tus fallos — pregunta {hechas_repaso} de {total_repaso}")
+        if st.button("❌ Salir del modo repaso"):
+            st.session_state.modo_repaso = False
+            st.session_state.test_iniciado = False
+            st.session_state.pregunta_actual = None
+            st.rerun()
+        niveles_sel, tipos_sel, lugares_sel, examenes_sel, etiquetas_sel = [], [], [], [], []
+    else:
+        niveles, tipos, lugares, examenes_opciones, etiquetas_disponibles = cargar_opciones_filtro()
 
-    f1, f2, f3, f4, f5 = st.columns(5)
-    with f1:
-        niveles_sel = st.multiselect("Nivel", niveles)
-    with f2:
-        tipos_sel = st.multiselect("Tipo de biblioteca", tipos)
-    with f3:
-        lugares_sel = st.multiselect("Lugar", lugares)
-    with f4:
-        examenes_sel_nombres = st.multiselect("Examen concreto", list(examenes_opciones.keys()))
-    with f5:
-        etiquetas_sel = st.multiselect("Tema / etiqueta", etiquetas_disponibles)
-    examenes_sel = [examenes_opciones[nombre] for nombre in examenes_sel_nombres]
+        f1, f2, f3, f4, f5 = st.columns(5)
+        with f1:
+            niveles_sel = st.multiselect("Nivel", niveles)
+        with f2:
+            tipos_sel = st.multiselect("Tipo de biblioteca", tipos)
+        with f3:
+            lugares_sel = st.multiselect("Lugar", lugares)
+        with f4:
+            examenes_sel_nombres = st.multiselect("Examen concreto", list(examenes_opciones.keys()))
+        with f5:
+            etiquetas_sel = st.multiselect("Tema / etiqueta", etiquetas_disponibles)
+        examenes_sel = [examenes_opciones[nombre] for nombre in examenes_sel_nombres]
 
     st.divider()
 
@@ -753,10 +807,17 @@ if pagina == "🧪 Test":
             st.rerun()
     else:
         if st.session_state.pregunta_actual is None:
-            st.warning("No hay preguntas disponibles con los filtros seleccionados.")
-            if st.button("🔁 Reintentar"):
-                nueva_pregunta(niveles_sel, tipos_sel, lugares_sel, examenes_sel, etiquetas_sel)
-                st.rerun()
+            if st.session_state.modo_repaso:
+                st.success("🎉 Has repasado todas las preguntas de tu lista de fallos.")
+                if st.button("Volver al test normal"):
+                    st.session_state.modo_repaso = False
+                    st.session_state.test_iniciado = False
+                    st.rerun()
+            else:
+                st.warning("No hay preguntas disponibles con los filtros seleccionados.")
+                if st.button("🔁 Reintentar"):
+                    nueva_pregunta(niveles_sel, tipos_sel, lugares_sel, examenes_sel, etiquetas_sel)
+                    st.rerun()
         else:
             id_pregunta, texto_pregunta = st.session_state.pregunta_actual
 
@@ -923,17 +984,35 @@ if pagina == "🧪 Test":
 
                 if st.session_state.corregido:
                     info_texto = obtener_info_extra(id_pregunta)
-                    if info_texto:
-                        if st.button("❓ Info adicional", key=f"info_{id_pregunta}"):
-                            st.session_state.mostrar_info = not st.session_state.mostrar_info
-                        if st.session_state.mostrar_info:
-                            st.info(info_texto)
+                    col_info, col_origen = st.columns(2)
+                    with col_info:
+                        if info_texto:
+                            if st.button("❓ Info adicional", key=f"info_{id_pregunta}", use_container_width=True):
+                                st.session_state.mostrar_info = not st.session_state.mostrar_info
+                    with col_origen:
+                        if st.button("📖 Ver origen", key=f"origen_{id_pregunta}", use_container_width=True):
+                            st.session_state.mostrar_origen = not st.session_state.mostrar_origen
+
+                    if st.session_state.mostrar_info and info_texto:
+                        st.info(info_texto)
+                    if st.session_state.mostrar_origen:
+                        origen = obtener_origen_pregunta(id_pregunta)
+                        if origen:
+                            st.caption(
+                                f"📖 **{origen['titulo']}** — {origen['organismo']}, "
+                                f"{origen['tipo_biblioteca']} ({origen['lugar']}, {origen['anio']}) · "
+                                f"Nivel {origen['nivel']} · ID examen: {origen['id_examen']} · "
+                                f"ID pregunta: {id_pregunta}"
+                            )
+                        else:
+                            st.caption("No se ha encontrado el examen de origen de esta pregunta.")
 
         if st.button("⏹️ Terminar test"):
             st.session_state.test_iniciado = False
             st.session_state.pregunta_actual = None
             st.session_state.editando_pregunta = False
             st.session_state.confirmar_eliminar_pregunta = False
+            st.session_state.modo_repaso = False
             st.rerun()
 
 
@@ -949,14 +1028,34 @@ elif pagina == "📉 Mis fallos":
         st.info("Todavía no has fallado ninguna pregunta. ¡Sigue así!")
     else:
         st.caption(f"{len(fallos_df)} fallo(s) registrados.")
-        if st.button("🗑️ Borrar mi historial de fallos"):
-            borrar_fallos_usuario(st.session_state.usuario)
-            st.rerun()
+        col_repasar, col_borrar = st.columns(2)
+        with col_repasar:
+            if st.button("🔁 Repasar mis fallos", type="primary", use_container_width=True):
+                ids_unicos = list(dict.fromkeys(fallos_df["id_pregunta"].tolist()))
+                random.shuffle(ids_unicos)
+                st.session_state.cola_repaso = ids_unicos
+                st.session_state.indice_repaso = 0
+                st.session_state.modo_repaso = True
+                st.session_state.test_iniciado = True
+                st.session_state.aciertos = 0
+                st.session_state.fallos = 0
+                nueva_pregunta([], [], [], [], [])
+                st.session_state.nav_radio = "🧪 Test"
+                st.rerun()
+        with col_borrar:
+            if st.button("🗑️ Borrar mi historial de fallos", use_container_width=True):
+                borrar_fallos_usuario(st.session_state.usuario)
+                st.rerun()
 
         for _, fila in fallos_df.iterrows():
             with st.expander(f"{fila['fecha']} — {fila['texto_pregunta'][:70]}"):
-                st.write(f"**Examen:** {fila['id_examen']}  |  **Pregunta:** {fila['id_pregunta']}")
-                st.write(fila["texto_pregunta"])
+                origen = obtener_origen_pregunta(fila["id_pregunta"])
+                if origen:
+                    st.caption(
+                        f"📖 {origen['titulo']} — {origen['organismo']}, {origen['tipo_biblioteca']} "
+                        f"({origen['lugar']}, {origen['anio']}) · Nivel {origen['nivel']}"
+                    )
+                st.write(f"**Pregunta ({fila['id_pregunta']}):** {fila['texto_pregunta']}")
                 st.error(f"Tu respuesta: {fila['respuesta_elegida']}")
                 st.success(f"Respuesta correcta: {fila['respuesta_correcta']}")
 
