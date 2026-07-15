@@ -158,10 +158,10 @@ def etiquetas_a_almacenamiento(lista_etiquetas):
     return ("," + ",".join(limpio) + ",") if limpio else ""
 
 
-def etiquetas_desde_almacenamiento(texto_guardado: str):
-    if not texto_guardado:
+def etiquetas_desde_almacenamiento(texto_guardado):
+    if not isinstance(texto_guardado, str) or not texto_guardado.strip(","):
         return []
-    return [t for t in texto_guardado.strip(",").split(",") if t]
+    return [t for t in texto_guardado.strip(",").split(",") if t]]
 
 
 def etiquetas_como_texto_editable(texto_guardado: str):
