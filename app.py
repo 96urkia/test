@@ -159,9 +159,9 @@ def etiquetas_a_almacenamiento(lista_etiquetas):
 
 
 def etiquetas_desde_almacenamiento(texto_guardado):
-    if not isinstance(texto_guardado, str) or not texto_guardado.strip(","):
+    if texto_guardado is None or pd.isna(texto_guardado) or not texto_guardado:
         return []
-    return [t for t in texto_guardado.strip(",").split(",") if t]
+    return [t for t in str(texto_guardado).strip(",").split(",") if t]
 
 
 def etiquetas_como_texto_editable(texto_guardado: str):
@@ -493,6 +493,29 @@ def borrar_fallos_usuario(usuario):
     guardar_y_sincronizar()
 
 
+def cargar_estadisticas_fallos(usuario=None):
+    """Historial de fallos enriquecido con nivel/tipo_biblioteca/año (del examen) y
+    etiquetas (de la pregunta, en su estado ACTUAL). usuario=None -> todos los usuarios."""
+    con = sqlite3.connect(DB_PATH)
+    condiciones, params = [], []
+    if usuario:
+        condiciones.append("hf.usuario = ?")
+        params.append(usuario)
+    where = ("WHERE " + " AND ".join(condiciones)) if condiciones else ""
+    query = f"""
+        SELECT hf.id_pregunta, hf.usuario, hf.fecha,
+               e.nivel, e.tipo_biblioteca, e.anio, e.titulo,
+               p.etiquetas
+        FROM historial_fallos hf
+        LEFT JOIN examenes e ON e.id_examen = hf.id_examen
+        LEFT JOIN preguntas p ON p.id_pregunta = hf.id_pregunta
+        {where}
+    """
+    df = pd.read_sql_query(query, con, params=params)
+    con.close()
+    return df
+
+
 def obtener_siguiente_de_repaso():
     """Devuelve la siguiente pregunta de la cola de repaso (st.session_state.cola_repaso),
     saltando las que hayan podido ser eliminadas mientras tanto. None si ya no quedan."""
@@ -739,7 +762,7 @@ with cab_der:
         st.session_state.clear()
         st.rerun()
 
-opciones_navegacion = ["🧪 Test", "📉 Mis fallos"]
+opciones_navegacion = ["🧪 Test", "📉 Mis fallos", "📊 Análisis"]
 if es_admin:
     opciones_navegacion.append("⚙️ Administración")
 if st.session_state.get("forzar_pagina"):
@@ -1062,6 +1085,56 @@ elif pagina == "📉 Mis fallos":
                 st.write(f"**Pregunta ({fila['id_pregunta']}):** {fila['texto_pregunta']}")
                 st.error(f"Tu respuesta: {fila['respuesta_elegida']}")
                 st.success(f"Respuesta correcta: {fila['respuesta_correcta']}")
+
+
+# ----------------------------------------------------------------------
+# PÁGINA: ANÁLISIS (todos los usuarios)
+# ----------------------------------------------------------------------
+
+elif pagina == "📊 Análisis":
+    st.subheader("📊 Análisis de fallos")
+
+    ver_todos = False
+    if es_admin:
+        ver_todos = st.checkbox("Ver de todos los usuarios (solo visible para admin)")
+
+    usuario_filtro = None if ver_todos else st.session_state.usuario
+    df_fallos = cargar_estadisticas_fallos(usuario_filtro)
+
+    if df_fallos.empty:
+        st.info("Todavía no hay fallos registrados para mostrar estadísticas.")
+    else:
+        st.caption(f"Basado en {len(df_fallos)} fallo(s) registrados"
+                   f"{' de todos los usuarios' if ver_todos else ''}.")
+
+        col_nivel, col_tipo = st.columns(2)
+        with col_nivel:
+            st.markdown("#### Por nivel")
+            conteo_nivel = df_fallos["nivel"].fillna("Sin nivel").value_counts().sort_index()
+            st.bar_chart(conteo_nivel)
+        with col_tipo:
+            st.markdown("#### Por tipo de biblioteca")
+            conteo_tipo = df_fallos["tipo_biblioteca"].fillna("Sin tipo").value_counts()
+            st.bar_chart(conteo_tipo)
+
+        st.markdown("#### Por año del examen")
+        anios_validos = df_fallos["anio"].dropna()
+        if not anios_validos.empty:
+            conteo_anio = anios_validos.astype(int).value_counts().sort_index()
+            st.bar_chart(conteo_anio)
+        else:
+            st.caption("Sin datos de año disponibles.")
+
+        st.markdown("#### Por etiqueta / tema")
+        todas_etiquetas = []
+        for valor in df_fallos["etiquetas"]:
+            todas_etiquetas.extend(etiquetas_desde_almacenamiento(valor))
+        if todas_etiquetas:
+            conteo_etiquetas = pd.Series(todas_etiquetas).value_counts()
+            st.bar_chart(conteo_etiquetas)
+        else:
+            st.caption("Ninguna de las preguntas falladas tiene etiquetas asignadas todavía "
+                       "(el admin puede añadirlas editando la pregunta).")
 
 
 # ----------------------------------------------------------------------
