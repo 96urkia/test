@@ -30,12 +30,13 @@ Requiere:
 
 import io
 import random
-from datetime import datetime
+from datetime import datetime, date, timedelta
 
 import gspread
 import pandas as pd
 import sqlite3
 import streamlit as st
+from fpdf import FPDF
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
@@ -213,6 +214,21 @@ def asegurar_esquema():
                    respuesta_elegida TEXT,
                    respuesta_correcta TEXT,
                    fecha TEXT
+               )"""
+        )
+        cambios = True
+
+    if not _tabla_existe(cur, "repeticion_espaciada"):
+        cur.execute(
+            """CREATE TABLE repeticion_espaciada (
+                   usuario TEXT NOT NULL,
+                   id_pregunta TEXT NOT NULL,
+                   repeticiones INTEGER DEFAULT 0,
+                   facilidad REAL DEFAULT 2.5,
+                   intervalo INTEGER DEFAULT 0,
+                   ultima_revision TEXT,
+                   proxima_revision TEXT,
+                   PRIMARY KEY (usuario, id_pregunta)
                )"""
         )
         cambios = True
@@ -516,6 +532,62 @@ def cargar_estadisticas_fallos(usuario=None):
     return df
 
 
+def _sanear_texto_pdf(texto):
+    """Los tipos de letra base de fpdf2 solo soportan latin-1; sustituye
+    cualquier carácter fuera de ese rango (emoji, etc.) en vez de romper
+    la generación del PDF."""
+    if texto is None:
+        return ""
+    return str(texto).encode("latin-1", "replace").decode("latin-1")
+
+
+def generar_pdf_fallos(usuario, fallos_df):
+    """Genera un PDF descargable con el historial de fallos del usuario,
+    incluyendo la información adicional de cada pregunta cuando existe."""
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.cell(0, 10, _sanear_texto_pdf("Mis fallos - Test Oposiciones Biblioteca"), ln=1)
+    pdf.set_font("Helvetica", "", 10)
+    pdf.set_text_color(90, 90, 90)
+    pdf.cell(0, 7, _sanear_texto_pdf(
+        f"Usuario: {usuario}  ·  Generado: {datetime.now().strftime('%d/%m/%Y %H:%M')}"
+        f"  ·  Total de fallos: {len(fallos_df)}"
+    ), ln=1)
+    pdf.set_text_color(0, 0, 0)
+    pdf.ln(4)
+
+    for _, fila in fallos_df.iterrows():
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.multi_cell(0, 6, _sanear_texto_pdf(f"{fila['fecha']}  ·  {fila['id_pregunta']}"))
+
+        pdf.set_font("Helvetica", "", 10)
+        pdf.multi_cell(0, 6, _sanear_texto_pdf(f"Pregunta: {fila['texto_pregunta']}"))
+
+        pdf.set_text_color(180, 0, 0)
+        pdf.multi_cell(0, 6, _sanear_texto_pdf(f"Tu respuesta: {fila['respuesta_elegida']}"))
+        pdf.set_text_color(0, 120, 0)
+        pdf.multi_cell(0, 6, _sanear_texto_pdf(f"Respuesta correcta: {fila['respuesta_correcta']}"))
+        pdf.set_text_color(0, 0, 0)
+
+        info = obtener_info_extra(fila["id_pregunta"])
+        if info:
+            pdf.set_font("Helvetica", "I", 9)
+            pdf.set_text_color(70, 70, 70)
+            pdf.multi_cell(0, 6, _sanear_texto_pdf(f"Info adicional: {info}"))
+            pdf.set_text_color(0, 0, 0)
+
+        pdf.ln(2)
+        pdf.set_draw_color(210, 210, 210)
+        y = pdf.get_y()
+        pdf.line(10, y, 200, y)
+        pdf.ln(4)
+
+    return bytes(pdf.output())
+
+
 def obtener_siguiente_de_repaso():
     """Devuelve la siguiente pregunta de la cola de repaso (st.session_state.cola_repaso),
     saltando las que hayan podido ser eliminadas mientras tanto. None si ya no quedan."""
@@ -534,6 +606,112 @@ def obtener_siguiente_de_repaso():
             return id_pregunta, df.iloc[0]["texto_pregunta"]
     st.session_state.indice_repaso = indice
     return None
+
+
+# ----------------------------------------------------------------------
+# REPETICIÓN ESPACIADA (algoritmo SM-2)
+# ----------------------------------------------------------------------
+#
+# Cada vez que el usuario corrige una pregunta (en modo normal o en modo
+# repaso) se actualiza su "ficha" en repeticion_espaciada:
+#   - repeticiones: nº de veces seguidas que la ha acertado.
+#   - facilidad (E-Factor): cuanto más alta, más se espacian los repasos.
+#   - intervalo: días hasta el próximo repaso.
+#   - proxima_revision: fecha (AAAA-MM-DD) a partir de la cual vuelve a
+#     tocar repasarla.
+# Un fallo la reinicia (intervalo=1, repeticiones=0) sin destruir la
+# facilidad acumulada del todo, tal como hace el algoritmo SM-2 clásico
+# (usado por Anki, SuperMemo, etc.).
+
+def _calcular_sm2(repeticiones, facilidad, intervalo, calidad):
+    """calidad: 5 = acierto, 2 = fallo (versión simplificada para test tipo A/B/C/D)."""
+    if calidad < 3:
+        repeticiones = 0
+        intervalo = 1
+    else:
+        if repeticiones == 0:
+            intervalo = 1
+        elif repeticiones == 1:
+            intervalo = 6
+        else:
+            intervalo = round(intervalo * facilidad)
+        repeticiones += 1
+
+    facilidad = facilidad + (0.1 - (5 - calidad) * (0.08 + (5 - calidad) * 0.02))
+    facilidad = max(facilidad, 1.3)
+    return repeticiones, facilidad, intervalo
+
+
+def actualizar_repeticion_espaciada(usuario, id_pregunta, es_correcta):
+    """Se llama cada vez que se corrige una pregunta. Crea o actualiza la
+    ficha SM-2 de ese usuario para esa pregunta y calcula la próxima fecha
+    de repaso."""
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        "SELECT repeticiones, facilidad, intervalo FROM repeticion_espaciada WHERE usuario=? AND id_pregunta=?",
+        (usuario, id_pregunta),
+    )
+    fila = cur.fetchone()
+    repeticiones, facilidad, intervalo = fila if fila else (0, 2.5, 0)
+
+    calidad = 5 if es_correcta else 2
+    repeticiones, facilidad, intervalo = _calcular_sm2(repeticiones, facilidad, intervalo, calidad)
+
+    hoy = date.today()
+    proxima = hoy + timedelta(days=intervalo)
+
+    cur.execute(
+        """INSERT INTO repeticion_espaciada
+               (usuario, id_pregunta, repeticiones, facilidad, intervalo, ultima_revision, proxima_revision)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(usuario, id_pregunta) DO UPDATE SET
+               repeticiones = excluded.repeticiones,
+               facilidad = excluded.facilidad,
+               intervalo = excluded.intervalo,
+               ultima_revision = excluded.ultima_revision,
+               proxima_revision = excluded.proxima_revision""",
+        (usuario, id_pregunta, repeticiones, facilidad, intervalo,
+         hoy.isoformat(), proxima.isoformat()),
+    )
+    con.commit()
+    con.close()
+    guardar_y_sincronizar()
+
+
+def obtener_pendientes_repaso_espaciado(usuario):
+    """IDs de preguntas (ya vistas al menos una vez) cuya proxima_revision
+    ya ha llegado, ordenadas de más atrasada a más reciente."""
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """SELECT re.id_pregunta
+           FROM repeticion_espaciada re
+           JOIN preguntas p ON p.id_pregunta = re.id_pregunta
+           WHERE re.usuario = ? AND re.proxima_revision <= ?
+             AND (p.visible IS NULL OR p.visible = 1)
+           ORDER BY re.proxima_revision ASC""",
+        (usuario, date.today().isoformat()),
+    )
+    ids = [fila[0] for fila in cur.fetchall()]
+    con.close()
+    return ids
+
+
+def obtener_estadisticas_repaso_espaciado(usuario):
+    """Resumen para el panel: nº en seguimiento, pendientes hoy y 'dominadas'
+    (intervalo largo => las tienes muy asentadas)."""
+    con = sqlite3.connect(DB_PATH)
+    df = pd.read_sql_query(
+        "SELECT intervalo, proxima_revision FROM repeticion_espaciada WHERE usuario = ?",
+        con, params=(usuario,),
+    )
+    con.close()
+    hoy = date.today().isoformat()
+    total = len(df)
+    pendientes = int((df["proxima_revision"] <= hoy).sum()) if total else 0
+    dominadas = int((df["intervalo"] >= 21).sum()) if total else 0
+    return {"total": total, "pendientes": pendientes, "dominadas": dominadas}
 
 
 # ----------------------------------------------------------------------
@@ -718,6 +896,7 @@ valores_por_defecto = {
     "mostrar_info": False,
     "mostrar_origen": False,
     "modo_repaso": False,
+    "tipo_repaso": None,
     "cola_repaso": [],
     "indice_repaso": 0,
 }
@@ -762,7 +941,7 @@ with cab_der:
         st.session_state.clear()
         st.rerun()
 
-opciones_navegacion = ["🧪 Test", "📉 Mis fallos", "📊 Análisis"]
+opciones_navegacion = ["🧪 Test", "📉 Mis fallos", "🔁 Repaso espaciado", "📊 Análisis"]
 if es_admin:
     opciones_navegacion.append("⚙️ Administración")
 if st.session_state.get("forzar_pagina"):
@@ -791,9 +970,13 @@ if pagina == "🧪 Test":
     if st.session_state.modo_repaso:
         total_repaso = len(st.session_state.cola_repaso)
         hechas_repaso = min(st.session_state.indice_repaso, total_repaso)
-        st.info(f"🔁 Modo repaso de tus fallos — pregunta {hechas_repaso} de {total_repaso}")
+        if st.session_state.tipo_repaso == "espaciado":
+            st.info(f"🔁 Repaso espaciado — pregunta {hechas_repaso} de {total_repaso}")
+        else:
+            st.info(f"🔁 Modo repaso de tus fallos — pregunta {hechas_repaso} de {total_repaso}")
         if st.button("❌ Salir del modo repaso"):
             st.session_state.modo_repaso = False
+            st.session_state.tipo_repaso = None
             st.session_state.test_iniciado = False
             st.session_state.pregunta_actual = None
             st.rerun()
@@ -990,6 +1173,9 @@ if pagina == "🧪 Test":
                                 correcta_texto = next((op["texto_respuesta"] for op in opciones if op["es_correcta"]), "")
                                 registrar_fallo(st.session_state.usuario, id_pregunta, texto_pregunta,
                                                  elegida["texto_respuesta"], correcta_texto)
+                            actualizar_repeticion_espaciada(
+                                st.session_state.usuario, id_pregunta, elegida["es_correcta"]
+                            )
                             st.rerun()
 
                 with col_siguiente:
@@ -1055,7 +1241,7 @@ elif pagina == "📉 Mis fallos":
         st.info("Todavía no has fallado ninguna pregunta. ¡Sigue así!")
     else:
         st.caption(f"{len(fallos_df)} fallo(s) registrados.")
-        col_repasar, col_borrar = st.columns(2)
+        col_repasar, col_borrar, col_exportar = st.columns(3)
         with col_repasar:
             if st.button("🔁 Repasar mis fallos", type="primary", use_container_width=True):
                 ids_unicos = list(dict.fromkeys(fallos_df["id_pregunta"].tolist()))
@@ -1063,6 +1249,7 @@ elif pagina == "📉 Mis fallos":
                 st.session_state.cola_repaso = ids_unicos
                 st.session_state.indice_repaso = 0
                 st.session_state.modo_repaso = True
+                st.session_state.tipo_repaso = "fallos"
                 st.session_state.test_iniciado = True
                 st.session_state.aciertos = 0
                 st.session_state.fallos = 0
@@ -1073,6 +1260,15 @@ elif pagina == "📉 Mis fallos":
             if st.button("🗑️ Borrar mi historial de fallos", use_container_width=True):
                 borrar_fallos_usuario(st.session_state.usuario)
                 st.rerun()
+        with col_exportar:
+            pdf_bytes = generar_pdf_fallos(st.session_state.usuario, fallos_df)
+            st.download_button(
+                "📄 Exportar a PDF",
+                data=pdf_bytes,
+                file_name=f"mis_fallos_{st.session_state.usuario}.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+            )
 
         for _, fila in fallos_df.iterrows():
             with st.expander(f"{fila['fecha']} — {fila['texto_pregunta'][:70]}"):
@@ -1085,6 +1281,62 @@ elif pagina == "📉 Mis fallos":
                 st.write(f"**Pregunta ({fila['id_pregunta']}):** {fila['texto_pregunta']}")
                 st.error(f"Tu respuesta: {fila['respuesta_elegida']}")
                 st.success(f"Respuesta correcta: {fila['respuesta_correcta']}")
+
+
+# ----------------------------------------------------------------------
+# PÁGINA: REPASO ESPACIADO (todos los usuarios)
+# ----------------------------------------------------------------------
+
+elif pagina == "🔁 Repaso espaciado":
+    st.subheader("🔁 Repaso espaciado")
+    st.caption(
+        "Cada pregunta que respondes (aquí o en el test normal) queda registrada. "
+        "El sistema calcula cuándo te conviene volver a verla: si aciertas, el "
+        "intervalo hasta el próximo repaso crece; si fallas, vuelve a corto plazo. "
+        "Es el mismo principio que usan apps como Anki (algoritmo SM-2)."
+    )
+
+    stats = obtener_estadisticas_repaso_espaciado(st.session_state.usuario)
+    pendientes_ids = obtener_pendientes_repaso_espaciado(st.session_state.usuario)
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("📌 Pendientes hoy", len(pendientes_ids))
+    col2.metric("📚 En seguimiento", stats["total"])
+    col3.metric("🏆 Dominadas", stats["dominadas"])
+
+    st.divider()
+
+    if pendientes_ids:
+        st.write(f"Tienes **{len(pendientes_ids)}** pregunta(s) listas para repasar hoy.")
+        if st.button("▶️ Empezar repaso espaciado", type="primary"):
+            st.session_state.cola_repaso = pendientes_ids
+            st.session_state.indice_repaso = 0
+            st.session_state.modo_repaso = True
+            st.session_state.tipo_repaso = "espaciado"
+            st.session_state.test_iniciado = True
+            st.session_state.aciertos = 0
+            st.session_state.fallos = 0
+            nueva_pregunta([], [], [], [], [])
+            st.session_state.forzar_pagina = "🧪 Test"
+            st.rerun()
+    elif stats["total"] == 0:
+        st.info(
+            "Todavía no hay preguntas en seguimiento. En cuanto respondas alguna en el "
+            "🧪 Test (modo normal), empezará a calcularse su repaso espaciado automáticamente."
+        )
+    else:
+        st.success("🎉 No tienes preguntas pendientes de repaso espaciado por hoy. ¡Vuelve mañana!")
+
+    with st.expander("¿Cómo funciona el cálculo?"):
+        st.write(
+            "- Cada pregunta guarda un factor de facilidad, un nº de aciertos seguidos "
+            "y un intervalo (días hasta el próximo repaso).\n"
+            "- Si aciertas, el intervalo crece (1 día → 6 días → 6×facilidad → ...).\n"
+            "- Si fallas, el intervalo vuelve a 1 día, para que la veas pronto otra vez.\n"
+            "- Preguntas con intervalo ≥ 21 días se consideran 'dominadas'.\n"
+            "- La lista de 'pendientes hoy' son aquellas cuya fecha de próximo repaso "
+            "ya ha llegado o ha pasado."
+        )
 
 
 # ----------------------------------------------------------------------
